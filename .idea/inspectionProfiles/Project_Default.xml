@@ -1,0 +1,18 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="load_pickle_file" />
+          <option value="transformers.modeling_electra" />
+          <option value="transformers.modeling_roberta" />
+          <option value="apex.*" />
+          <option value="transformers.trainer_utils" />
+          <option value="transformers.EarlyStoppingCallback" />
+          <option value="transformers.TrainingArguments" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
