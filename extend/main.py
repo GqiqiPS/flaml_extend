@@ -3,6 +3,7 @@ import pickle
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 
 import numpy as np
 import torch
@@ -86,7 +87,34 @@ class DistilBertEstimator(BaseEstimator):
                 "domain": tune.loguniform(lower=1e-6, upper=1e-3),
                 "init_value": 1e-5,
             },
+            "num_train_epochs": {
+                "domain": tune.loguniform(lower=0.1, upper=10.0),
+            },
+            "per_device_train_batch_size": {
+                "domain": tune.choice([4, 8, 16, 32]),
+                "init_value": 32,
+            },
+            "warmup_ratio": {
+                "domain": tune.uniform(lower=0.0, upper=0.3),
+                "init_value": 0.0,
+            },
+            "weight_decay": {
+                "domain": tune.uniform(lower=0.0, upper=0.3),
+                "init_value": 0.0,
+            },
+            "adam_epsilon": {
+                "domain": tune.loguniform(lower=1e-8, upper=1e-6),
+                "init_value": 1e-6,
+            },
+            "seed": {"domain": tune.choice(list(range(40, 45))), "init_value": 42},
+            "global_max_steps": {"domain": sys.maxsize, "init_value": sys.maxsize},
+            "alpha_ce":{"domain":tune.uniform(lower=0.0, upper=1.0),"init_value": 0.5},
+            "alpha_mlm": {"domain": tune.uniform(lower=0.0, upper=1.0),"init_value": 0.0}, # if mlm, use mlm over clm
+            "alpha_clm": {"domain": tune.uniform(lower=0.0, upper=1.0),"init_value": 0.5},
+            "alpha_mse": {"domain": tune.uniform(lower=0.0, upper=1.0),"init_value": 0.0},
+            "alpha_cos": {"domain": tune.uniform(lower=0.0, upper=1.0), "init_value": 0.0},
         }
+
 
     def fit(self, X_train: DataFrame, y_train: Series, budget=None, **kwargs):
         args = Args()
