@@ -237,14 +237,14 @@ class DistilBertEstimator(BaseEstimator):
         assert self.params["alpha_ce"] + self.params["alpha_mlm"] + self.params["alpha_clm"] + self.params["alpha_mse"] + self.params["alpha_cos"] > 0.0
 
 
-    def freeze_pos_embeddings(student,self):
+    def freeze_pos_embeddings(self,student):
         if self.student_type == "roberta":
             student.roberta.embeddings.position_embeddings.weight.requires_grad = False
         elif self.student_type == "gpt2":
             student.transformer.wpe.weight.requires_grad = False
 
 
-    def freeze_token_type_embeddings(student, self):
+    def freeze_token_type_embeddings(self,student):
         if self.student_type == "roberta":
             student.roberta.embeddings.token_type_embeddings.weight.requires_grad = False
 
@@ -273,17 +273,27 @@ class DistilBertEstimator(BaseEstimator):
         warmup_prop = self.params["warmup_prop"]
         # hyerpremeter end
 
-        teacher_name = "bert-base-uncased"
+
+        # teacher
+        teacher_name = "{}-base-uncased".format(self.teacher_type)
         teacher = self.teacher_class.from_pretrained(
             teacher_name, output_hidden_states=True
         )
 
-        student_config = "distilbert-base-uncased.json"
+        # student
+
+        student_config = "{}-base-uncased.json".format(self.student_type)
         stu_architecture_config = DistilBertConfig.from_pretrained(student_config)
         student = self.student_class(stu_architecture_config)
 
-        student.train()
-        teacher.eval()
+        # freezing #
+        if self.custom_hpo_args.freeze_pos_embs:
+            self.freeze_pos_embeddings(student)
+        if self.custom_hpo_args.freeze_token_type_embds:
+            self.freeze_token_type_embeddings(student)
+
+        # student.train()
+        # teacher.eval()
 
         assert student.config.vocab_size == teacher.config.vocab_size
         assert student.config.hidden_size == teacher.config.hidden_size
@@ -291,8 +301,15 @@ class DistilBertEstimator(BaseEstimator):
             student.config.max_position_embeddings == teacher.config.max_position_embeddings
         )
 
-        student_config = student.config
+        # student_config = student.config
         # vocab_size = student.config.vocab_size
+
+        # DISTILLER #
+        torch.cuda.empty_cache()
+        distiller = Distiller(
+            params=args, dataset=train_lm_seq_dataset, token_probs=token_probs, student=student, teacher=teacher
+        )
+        distiller.train()
 
         dataloader = self._preprocess(X_train, y_train, batch_size=batch_size)
 
@@ -306,105 +323,110 @@ class DistilBertEstimator(BaseEstimator):
         )
         warmup_steps = math.ceil(num_train_optimization_steps * warmup_prop)
 
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [
-                    p
-                    for n, p in student.named_parameters()
-                    if not any(nd in n for nd in no_decay) and p.requires_grad
-                ],
-                "weight_decay": weight_decay,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in student.named_parameters()
-                    if any(nd in n for nd in no_decay) and p.requires_grad
-                ],
-                "weight_decay": 0.0,
-            },
-        ]
+        # # Prepare optimizer and schedule (linear warmup and decay)
+        #
+        # no_decay = ["bias", "LayerNorm.weight"]
+        # optimizer_grouped_parameters = [
+        #     {
+        #         "params": [
+        #             p
+        #             for n, p in student.named_parameters()
+        #             if not any(nd in n for nd in no_decay) and p.requires_grad
+        #         ],
+        #         "weight_decay": weight_decay,
+        #     },
+        #     {
+        #         "params": [
+        #             p
+        #             for n, p in student.named_parameters()
+        #             if any(nd in n for nd in no_decay) and p.requires_grad
+        #         ],
+        #         "weight_decay": 0.0,
+        #     },
+        # ]
+        #
+        # optimizer = AdamW(
+        #     optimizer_grouped_parameters,
+        #     lr=learning_rate,
+        #     eps=adam_epsilon,
+        #     betas=(0.9, 0.98),
+        # )
+        #
+        # scheduler = get_linear_schedule_with_warmup(
+        #     optimizer,
+        #     num_warmup_steps=warmup_steps,
+        #     num_training_steps=num_train_optimization_steps,
+        # )
 
-        optimizer = AdamW(
-            optimizer_grouped_parameters,
-            lr=learning_rate,
-            eps=adam_epsilon,
-            betas=(0.9, 0.98),
-        )
-
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=num_train_optimization_steps,
-        )
-
-        n_total_iter = 0
-        epoch = 0
-        total_loss_epochs = []
-        for _ in range(n_epoch):
-            total_loss_epoch = 0
-            n_iter = 0
-            for batch in tqdm(dataloader):
-                student_outputs = student(batch[0], output_hidden_states=True)
-                teacher_outputs = teacher(batch[0], output_hidden_states=True)
-
-                s_logits, s_h = (
-                    student_outputs["logits"],
-                    student_outputs["hidden_states"],
-                )
-                t_logits, t_h = (
-                    teacher_outputs["logits"],
-                    teacher_outputs["hidden_states"],
-                )
-
-                assert s_logits.size() == t_logits.size()
-
-                loss_ce = (
-                    ce_loss_fct(
-                        nn.functional.log_softmax(s_logits / temperature, dim=-1),
-                        nn.functional.softmax(t_logits / temperature, dim=-1),
-                    )
-                    * (temperature) ** 2
-                )
-                loss = alpha_ce * loss_ce
-
-                loss_clm = lm_loss_fct(s_logits, batch[1])
-
-                loss += alpha_clm * loss_clm
-
-                dim = s_h[-1].shape[0]
-                slh = s_h[-1].view(dim, -1)
-                tlh = t_h[-1].view(dim, -1)
-                loss_cos = cosine_loss_fct(
-                    slh, tlh, target=slh.new(slh.size(0)).fill_(1)
-                )
-                loss += alpha_ca * loss_cos
-
-                total_loss_epoch += loss.item()
-
-                # Check for NaN
-                if (loss != loss).data.any():
-                    raise ValueError("NaN detected")
-                    # sys.exit(1)
-
-                loss.backward()
-                n_iter += 1
-                n_total_iter += 1
-
-                if n_iter % gradient_accumulation_steps == 0:
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    scheduler.step()
-
-                    break
-
-            total_loss_epochs.append(total_loss_epoch)
-            epoch += 1
-
-        self._model = student
-        self._model.model_id = self.trial_id
-        return total_loss_epochs[-1]
+        # n_total_iter = 0
+        # epoch = 0
+        # total_loss_epochs = []
+        # n_epoch = 3
+        # for _ in range(n_epoch):
+        #     total_loss_epoch = 0
+        #     n_iter = 0
+        #     student.train()
+        #     teacher.eval()
+        #     for batch in tqdm(dataloader):
+        #         student_outputs = student(batch[0], output_hidden_states=True)
+        #         teacher_outputs = teacher(batch[0], output_hidden_states=True)
+        #
+        #         s_logits, s_h = (
+        #             student_outputs["logits"],
+        #             student_outputs["hidden_states"],
+        #         )
+        #         t_logits, t_h = (
+        #             teacher_outputs["logits"],
+        #             teacher_outputs["hidden_states"],
+        #         )
+        #
+        #         assert s_logits.size() == t_logits.size()
+        #
+        #         loss_ce = (
+        #             ce_loss_fct(
+        #                 nn.functional.log_softmax(s_logits / temperature, dim=-1),
+        #                 nn.functional.softmax(t_logits / temperature, dim=-1),
+        #             )
+        #             * (temperature) ** 2
+        #         )
+        #         loss = alpha_ce * loss_ce
+        #
+        #         loss_clm = lm_loss_fct(s_logits, batch[1])
+        #
+        #         loss += alpha_clm * loss_clm
+        #
+        #         dim = s_h[-1].shape[0]
+        #         slh = s_h[-1].view(dim, -1)
+        #         tlh = t_h[-1].view(dim, -1)
+        #         loss_cos = cosine_loss_fct(
+        #             slh, tlh, target=slh.new(slh.size(0)).fill_(1)
+        #         )
+        #         loss += alpha_ca * loss_cos
+        #
+        #         total_loss_epoch += loss.item()
+        #
+        #         # Check for NaN
+        #         if (loss != loss).data.any():
+        #             raise ValueError("NaN detected")
+        #             # sys.exit(1)
+        #
+        #         loss.backward()
+        #         n_iter += 1
+        #         n_total_iter += 1
+        #
+        #         if n_iter % gradient_accumulation_steps == 0:
+        #             optimizer.step()
+        #             optimizer.zero_grad()
+        #             scheduler.step()
+        #
+        #             break
+        #
+        #     total_loss_epochs.append(total_loss_epoch)
+        #     epoch += 1
+        #
+        # self._model = student
+        # self._model.model_id = self.trial_id
+        # return total_loss_epochs[-1]
 
     def _get_best_student(self):
         if self._model:
