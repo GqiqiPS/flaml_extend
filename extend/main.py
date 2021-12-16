@@ -16,16 +16,22 @@ from flaml.model import BaseEstimator
 from pandas import DataFrame, Series
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+from distiller import Distiller
 from transformers import (
     BertConfig,
     BertForMaskedLM,
-    BertForSequenceClassification,
     BertTokenizer,
     DistilBertConfig,
     DistilBertForMaskedLM,
-    DistilBertForSequenceClassification,
     DistilBertTokenizer,
+    GPT2Config,
+    GPT2LMHeadModel,
+    GPT2Tokenizer,
+    RobertaConfig,
+    RobertaForMaskedLM,
+    RobertaTokenizer,
 )
+
 
 
 class LmSeqsDataset(Dataset):
@@ -115,16 +121,26 @@ class DistilBertEstimator(BaseEstimator):
 
     name = "DistilBertEstimator"
 
-    def __init__(self, task="seq-classification", **config):
+    def __init__(self, task="seq-classification", student_type='distilbert',teacher_type='bert',**config):
         super().__init__(task, **config)
         self.trial_id = str(uuid.uuid1().hex)[:8]
         print(f"Initialized {self.trial_id}")
 
-        self._model = None
-        self.teacher_class = BertForSequenceClassification
-        self.student_class = DistilBertForSequenceClassification
+        MODEL_CLASSES = {
+            "distilbert": (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer),
+            "roberta": (RobertaConfig, RobertaForMaskedLM, RobertaTokenizer),
+            "bert": (BertConfig, BertForMaskedLM, BertTokenizer),
+            "gpt2": (GPT2Config, GPT2LMHeadModel, GPT2Tokenizer),
+        }
 
-    @classmethod
+        self.student_type = student_type
+        self.teacher_type = teacher_type
+
+        self._model = None
+        self.student_config_class, self.student_model_class, _ = MODEL_CLASSES[self.student_type]
+        self.teacher_config_class, self.teacher_model_class, self.teacher_tokenizer_class = MODEL_CLASSES[self.teacher_type]
+
+@classmethod
     def search_space(cls, **params):
         return {
             "learning_rate": {
@@ -170,21 +186,77 @@ class DistilBertEstimator(BaseEstimator):
                 "domain": tune.uniform(lower=0.0, upper=1.0),
                 "init_value": 0.0,
             },
-            "alpha_ca": {
+            "alpha_mse": {
                 "domain": tune.uniform(lower=0.0, upper=1.0),
                 "init_value": 0.1,
             },
         }
+
+
+    def _init_hpo_args(self, automl_fit_kwargs: dict = None):
+        from utils import DISTILHPOArgs
+
+        custom_hpo_args = DISTILHPOArgs()
+        for key, val in automl_fit_kwargs["custom_hpo_args"].items():
+            assert (
+                key in custom_hpo_args.__dict__
+        ), "The specified key {} is not in the argument list of flaml.nlp.utils::HPOArgs".format(
+            key
+        )
+            setattr(custom_hpo_args, key, val)
+        self.custom_hpo_args = custom_hpo_args
+
+
+    def sanity_checks(self):
+        """
+        A bunch of args sanity checks to perform even starting...
+        """
+        assert (self.custom_hpo_args.mlm and self.params["alpha_mlm"] > 0.0) or (not self.custom_hpo_args.mlm and self.params["alpha_mlm"] == 0.0)
+        assert (self.params["alpha_mlm"] > 0.0 and self.params["alpha_clm"] == 0.0) or (self.params["alpha_mlm"] == 0.0 and self.params["alpha_clm"] > 0.0)
+        if self.custom_hpo_args.mlm:
+            # assert os.path.isfile(args.token_counts)
+            assert (self.student_type in ["roberta", "distilbert"]) and (self.teacher_type in ["roberta", "bert"])
+        else:
+            assert (self.student_type in ["gpt2"]) and (self.teacher_type in ["gpt2"])
+
+        assert self.teacher_type == self.student_type or (
+                self.student_type == "distilbert" and self.teacher_type == "bert"
+        )
+        # assert os.path.isfile(args.student_config)
+        if self.custom_hpo_args.student_pretrained_weights is not None:
+            assert os.path.isfile(self.custom_hpo_args.student_pretrained_weights)
+
+        if self.custom_hpo_args.freeze_token_type_embds:
+            assert self.student_type in ["roberta"]
+
+        assert self.params["alpha_ce"] >= 0.0
+        assert self.params["alpha_mlm"] >= 0.0
+        assert self.params["alpha_clm"] >= 0.0
+        assert self.params["alpha_mse"] >= 0.0
+        assert self.params["alpha_cos"] >= 0.0
+        assert self.params["alpha_ce"] + self.params["alpha_mlm"] + self.params["alpha_clm"] + self.params["alpha_mse"] + self.params["alpha_cos"] > 0.0
+
+
+    def freeze_pos_embeddings(student,self):
+        if self.student_type == "roberta":
+            student.roberta.embeddings.position_embeddings.weight.requires_grad = False
+        elif self.student_type == "gpt2":
+            student.transformer.wpe.weight.requires_grad = False
+
+
+    def freeze_token_type_embeddings(student, self):
+        if self.student_type == "roberta":
+            student.roberta.embeddings.token_type_embeddings.weight.requires_grad = False
 
     def fit(self, X_train: DataFrame, y_train: Series, budget=None, **kwargs):
         import math
         from torch.optim import AdamW
         from transformers import get_linear_schedule_with_warmup
 
-        n_epoch = 3
+        self._init_hpo_args(kwargs)
+        self.sanity_checks()
 
         # hyperpremeter start
-        temperature = self.params["temperature"]
         learning_rate = self.params["learning_rate"]
         batch_size = self.params["batch_size"]
 
@@ -192,8 +264,9 @@ class DistilBertEstimator(BaseEstimator):
         gradient_accumulation_steps = self.params["gradient_accumulation_steps"]
         alpha_ce = self.params["alpha_ce"]
         alpha_clm = self.params["alpha_clm"]
-
-        alpha_ca = self.params["alpha_ca"]
+        alpha_mlm = self.params["alpha_mlm"]
+        alpha_cos = self.params["alpha_cos"]
+        alpha_mse = self.params["alpha_mse"]
 
         adam_epsilon = self.params["adam_epsilon"]
         weight_decay = self.params["weight_decay"]
